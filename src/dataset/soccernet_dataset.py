@@ -4,19 +4,6 @@ from collections import Counter
 
 
 def find_actions(frames_root="data/frames"):
-    """
-    Scan the pre-extracted frames folder and build a catalogue.
-
-    Returns a list of dicts:
-    [
-        {
-            "action_id": "action_1",
-            "split": "train",
-            "clips": ["data/frames/train/action_1/clip1.npy", ...]
-        },
-        ...
-    ]
-    """
     actions = []
 
     for split in ["train", "valid", "test", "challenge"]:

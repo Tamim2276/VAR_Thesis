@@ -10,18 +10,6 @@ def preprocess_and_save(
     num_frames=16,
     output_size=(224, 224)
 ):
-    """
-    Read every clip from soccernet, extract frames, save as .npy files.
-    
-    .npy is numpy's native format — loads instantly, no video decoding needed.
-    
-    Folder structure after running:
-    data/frames/
-    └── train/
-        └── action_1/
-            ├── clip1.npy   ← shape (16, 224, 224, 3)
-            └── clip2.npy
-    """
 
     splits = ["train", "valid", "test", "challenge"]
     total_saved = 0
