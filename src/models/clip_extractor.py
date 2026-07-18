@@ -41,7 +41,8 @@ def extract_spatial_tokens(model, preprocess, frames_numpy):
     T = frames_numpy.shape[0]  # number of frames,16
     cls_list = []
     spatial_list = []
-
+    device = next(model.parameters()).device
+    
     with torch.no_grad():  # no gradients needed for feature extraction
         for i in range(T):
 
@@ -54,7 +55,7 @@ def extract_spatial_tokens(model, preprocess, frames_numpy):
 
             # Step 3 — add batch dimension
             # (3, 224, 224) → (1, 3, 224, 224)
-            frame_tensor = frame_tensor.unsqueeze(0)
+            frame_tensor = frame_tensor.unsqueeze(0).to(device)
 
             # Step 4 — run through CLIP visual encoder
             # returns ALL tokens including spatial patches
@@ -67,8 +68,9 @@ def extract_spatial_tokens(model, preprocess, frames_numpy):
             cls_token = tokens[:, 0, :]      # (1, 1024) — summary token
             patch_tokens = tokens[:, 1:, :]  # (1, 256, 1024) — spatial tokens
 
-            cls_list.append(cls_token.squeeze(0))       # (1024,)
-            spatial_list.append(patch_tokens.squeeze(0))  # (256, 1024)
+            # Move back to CPU for list collection to save VRAM, or leave if VRAM is abundant
+            cls_list.append(cls_token.squeeze(0).cpu())     # (1024,)
+            spatial_list.append(patch_tokens.squeeze(0).cpu())  # (256, 1024)
 
     # Stack all frames together
     cls_tokens = torch.stack(cls_list, dim=0)       # (T, 1024)
