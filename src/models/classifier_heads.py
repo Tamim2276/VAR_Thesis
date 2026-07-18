@@ -19,14 +19,17 @@ class FoulClassifier(nn.Module):
         """
         super(FoulClassifier, self).__init__()
 
+        # New deeper with batch norm
         self.classifier = nn.Sequential(
-            # Layer 1 — reduce from 1024 to 512
             nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),            
-            nn.Dropout(p=0.3),   
-
-            # Layer 2 — reduce from 512 to num_classes
-            nn.Linear(hidden_dim, num_classes)
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(p=0.3),
+            nn.Linear(hidden_dim, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(p=0.2),
+            nn.Linear(256, num_classes)
         )
 
     def forward(self, x):
@@ -56,11 +59,17 @@ class SeverityClassifier(nn.Module):
         """
         super(SeverityClassifier, self).__init__()
 
+        # New deeper with batch norm
         self.classifier = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
             nn.Dropout(p=0.3),
-            nn.Linear(hidden_dim, num_classes)
+            nn.Linear(hidden_dim, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(p=0.2),
+            nn.Linear(256, num_classes)
         )
 
     def forward(self, x):
