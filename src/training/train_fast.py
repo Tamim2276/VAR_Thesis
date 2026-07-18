@@ -3,47 +3,94 @@ import sys
 import json
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+from collections import Counter
 
 sys.path.append('.')
 from src.models.classifier_heads import XVARSClassifiers
 from src.dataset.annotation_loader import load_annotations, get_split_samples
 
 
+# ── Focal Loss ──────────────────────────────────────────────────────────────
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for imbalanced classification.
+    Designed specifically for datasets where one class dominates.
+
+    How it works:
+    - Easy examples (model already confident) get DOWN-weighted
+    - Hard examples (model uncertain) get UP-weighted
+    - gamma=2 is the standard value from the original paper
+
+    Compare to CrossEntropyLoss:
+    - CrossEntropy treats all examples equally
+    - alpha additionally increases the loss from minority classes
+    """
+    def __init__(self, gamma=2.0, alpha=None):
+        super().__init__()
+        self.gamma = gamma
+        if alpha is None:
+            self.alpha = None
+        else:
+            self.register_buffer("alpha", alpha.float())
+
+    def forward(self, logits, targets):
+        log_probs = F.log_softmax(logits, dim=1)
+        log_pt = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        pt = log_pt.exp()
+        ce_loss = -log_pt
+
+        # alpha upweights rare classes; the focal term downweights easy ones.
+        if self.alpha is not None:
+            ce_loss = self.alpha[targets] * ce_loss
+        focal_loss = (1 - pt) ** self.gamma * ce_loss
+
+        return focal_loss.mean()
+
+
+# Dataset and training functions are below. These are used in train_fast.py to train the classifier heads on pre-computed CLIP features.
+def inverse_frequency_weights(samples, label_key, num_classes, device):
+    """Give each class equal total contribution to the training loss."""
+    counts = Counter(sample[label_key] for sample in samples)
+    total = len(samples)
+    weights = [total / (num_classes * counts.get(class_id, 1))
+               for class_id in range(num_classes)]
+    return torch.tensor(weights, dtype=torch.float32, device=device), counts
+
+
 class FeatureDataset(Dataset):
     """
-    Loads pre-computed CLIP features instead of raw frames.
-    Each __getitem__ just loads a tiny .pt file — instant.
-    No CLIP inference during training at all.
+    Loads pre-computed CLIP features from data/features/.
+    Each file is a tiny .pt tensor — loads instantly.
+    No CLIP inference happens during training at all.
     """
 
     def __init__(self, samples, features_root="data/features"):
-        self.features_root = features_root
-
-        # Build feature path for each sample
-        # replace data/frames with data/features and .npy with .pt
-        self.items = []
+        self.items   = []
         skipped = 0
 
         for s in samples:
-            feat_path = s["clip_path"] \
-                .replace("data/frames", features_root) \
-                .replace("data\\frames", features_root) \
+            feat_path = (
+                s["clip_path"]
+                .replace("data/frames",  features_root)
+                .replace("data\\frames", features_root)
                 .replace(".npy", ".pt")
-            feat_path = feat_path.replace("\\", "/")
+                .replace("\\", "/")
+            )
 
             if os.path.exists(feat_path):
                 self.items.append({
-                    "feat_path"  : feat_path,
-                    "foul_label" : s["foul_label"],
-                    "sev_label"  : s["sev_label"],
+                    "feat_path" : feat_path,
+                    "foul_label": s["foul_label"],
+                    "sev_label" : s["sev_label"],
                 })
             else:
                 skipped += 1
 
         if skipped > 0:
-            print(f"Warning: {skipped} clips have no feature file — skipped")
+            print(f"  Warning: {skipped} clips missing feature file — skipped")
 
     def __len__(self):
         return len(self.items)
@@ -51,12 +98,10 @@ class FeatureDataset(Dataset):
     def __getitem__(self, idx):
         item = self.items[idx]
 
-        # Load pre-computed features — instant
-        data = torch.load(item["feat_path"], map_location="cpu")
-        cls_tokens = data["cls"]  # (16, 1024)
-
-        # Average across 16 frames → video vector
-        video_vector = cls_tokens.mean(dim=0)  # (1024,)
+        data         = torch.load(item["feat_path"], map_location="cpu",
+                                  weights_only=True)
+        cls_tokens   = data["cls"]              # (16, 1024)
+        video_vector = cls_tokens.mean(dim=0)   # (1024,)  average over frames
 
         foul_label = torch.tensor(item["foul_label"], dtype=torch.long)
         sev_label  = torch.tensor(item["sev_label"],  dtype=torch.long)
@@ -64,8 +109,9 @@ class FeatureDataset(Dataset):
         return video_vector, foul_label, sev_label
 
 
+# Training functions 
 def train_one_epoch(classifiers, loader, optimizer,
-                    foul_criterion, sev_criterion, device, epoch):
+                    foul_criterion, sev_criterion, scheduler, device, epoch):
     classifiers.train()
 
     total_loss    = 0.0
@@ -81,12 +127,19 @@ def train_one_epoch(classifiers, loader, optimizer,
         sev_labels    = sev_labels.to(device)
 
         foul_logits, sev_logits = classifiers(video_vectors)
-        loss = foul_criterion(foul_logits, foul_labels) + \
-               sev_criterion(sev_logits,  sev_labels)
+
+        foul_loss = foul_criterion(foul_logits, foul_labels)
+        sev_loss  = sev_criterion(sev_logits,  sev_labels)
+        loss      = foul_loss + sev_loss
 
         optimizer.zero_grad()
         loss.backward()
+
+        # Gradient clipping — prevents loss explosion
+        torch.nn.utils.clip_grad_norm_(classifiers.parameters(), max_norm=1.0)
+
         optimizer.step()
+        scheduler.step()
 
         total_loss    += loss.item()
         total_samples += video_vectors.shape[0]
@@ -98,14 +151,14 @@ def train_one_epoch(classifiers, loader, optimizer,
 
         progress.set_postfix({
             "loss"    : f"{loss.item():.3f}",
-            "foul_acc": f"{foul_correct/total_samples*100:.1f}%",
-            "sev_acc" : f"{sev_correct/total_samples*100:.1f}%",
+            "foul"    : f"{foul_correct / total_samples * 100:.1f}%",
+            "sev"     : f"{sev_correct  / total_samples * 100:.1f}%",
         })
 
     return (
-        total_loss    / len(loader),
-        foul_correct  / total_samples * 100,
-        sev_correct   / total_samples * 100,
+        total_loss   / len(loader),
+        foul_correct / total_samples * 100,
+        sev_correct  / total_samples * 100,
     )
 
 
@@ -117,14 +170,20 @@ def evaluate(classifiers, loader, foul_criterion,
     foul_correct  = 0
     sev_correct   = 0
     total_samples = 0
+    foul_support  = [0, 0]
+    foul_hits     = [0, 0]
+    foul_predicted = [0, 0]
 
     with torch.no_grad():
-        for video_vectors, foul_labels, sev_labels in tqdm(loader, desc=f"[{split_name}]"):
+        for video_vectors, foul_labels, sev_labels in tqdm(
+            loader, desc=f"[{split_name}]"
+        ):
             video_vectors = video_vectors.to(device)
             foul_labels   = foul_labels.to(device)
             sev_labels    = sev_labels.to(device)
 
             foul_logits, sev_logits = classifiers(video_vectors)
+
             loss = foul_criterion(foul_logits, foul_labels) + \
                    sev_criterion(sev_logits, sev_labels)
 
@@ -136,45 +195,80 @@ def evaluate(classifiers, loader, foul_criterion,
             foul_correct += (foul_preds == foul_labels).sum().item()
             sev_correct  += (sev_preds  == sev_labels).sum().item()
 
-    return (
-        total_loss   / len(loader),
-        foul_correct / total_samples * 100,
-        sev_correct  / total_samples * 100,
-    )
+            for class_id in range(2):
+                class_mask = foul_labels == class_id
+                foul_support[class_id] += class_mask.sum().item()
+                foul_hits[class_id] += (
+                    (foul_preds == class_id) & class_mask
+                ).sum().item()
+                foul_predicted[class_id] += (foul_preds == class_id).sum().item()
+
+    foul_recall = [
+        100 * hits / support if support else 0.0
+        for hits, support in zip(foul_hits, foul_support)
+    ]
+    return {
+        "loss": total_loss / len(loader),
+        "foul_acc": foul_correct / total_samples * 100,
+        "sev_acc": sev_correct / total_samples * 100,
+        "foul_balanced_acc": sum(foul_recall) / len(foul_recall),
+        "foul_recall": foul_recall,
+        "foul_predictions": foul_predicted,
+    }
 
 
+def print_class_distribution(train_samples):
+    """Print label distribution so we know how imbalanced the data is."""
+    foul_counts = Counter(s["foul_label"] for s in train_samples)
+    sev_counts  = Counter(s["sev_label"]  for s in train_samples)
+    total = len(train_samples)
+
+    foul_names = {0: "No foul", 1: "Foul"}
+    sev_names  = {0: "No card", 1: "No card+", 2: "Yellow", 3: "Red"}
+
+    print("\n  Foul label distribution:")
+    for k, v in sorted(foul_counts.items()):
+        print(f"    {foul_names[k]:12s}: {v:5d}  ({v/total*100:.1f}%)")
+
+    print("  Severity label distribution:")
+    for k, v in sorted(sev_counts.items()):
+        print(f"    {sev_names[k]:12s}: {v:5d}  ({v/total*100:.1f}%)")
+
+
+# Main
 if __name__ == "__main__":
 
-    # Config
+    # Config 
     FEATURES_ROOT = "data/features"
-    BATCH_SIZE    = 64    # much larger now — no CLIP bottleneck
-    NUM_EPOCHS    = 20
+    BATCH_SIZE    = 64
+    NUM_EPOCHS    = 50
     LR            = 1e-4
     DEVICE        = "xpu"
     SAVE_DIR      = "models"
     LOG_DIR       = "logs"
-    #
+
 
     os.makedirs(SAVE_DIR, exist_ok=True)
-    os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(LOG_DIR,  exist_ok=True)
 
-    # Verify XPU
+    # Device check
     if DEVICE == "xpu" and not torch.xpu.is_available():
         print("XPU not available, falling back to CPU")
         DEVICE = "cpu"
     print(f"Device: {DEVICE}")
 
-    # Load annotations
+    # Annotations
     print("\nLoading annotations...")
     all_samples   = load_annotations()
     train_samples = get_split_samples(all_samples, "train")
     valid_samples = get_split_samples(all_samples, "valid")
+    print_class_distribution(train_samples)
 
-    # Build feature datasets
+    # Datasets
     print("\nBuilding feature datasets...")
     train_dataset = FeatureDataset(train_samples, FEATURES_ROOT)
     valid_dataset = FeatureDataset(valid_samples, FEATURES_ROOT)
-    print(f"Train: {len(train_dataset)} | Valid: {len(valid_dataset)}")
+    print(f"  Train: {len(train_dataset)} | Valid: {len(valid_dataset)}")
 
     train_loader = DataLoader(
         train_dataset, batch_size=BATCH_SIZE,
@@ -184,81 +278,89 @@ if __name__ == "__main__":
         valid_dataset, batch_size=BATCH_SIZE,
         shuffle=False, num_workers=0
     )
-    print(f"Train batches: {len(train_loader)} | Valid batches: {len(valid_loader)}")
+    print(f"  Train batches: {len(train_loader)} | "
+          f"Valid batches: {len(valid_loader)}")
 
-    # Build model
+    foul_weights, _ = inverse_frequency_weights(
+        train_dataset.items, "foul_label", num_classes=2, device=DEVICE
+    )
+    sev_weights, _ = inverse_frequency_weights(
+        train_dataset.items, "sev_label", num_classes=4, device=DEVICE
+    )
+    print(f"  Cached-train foul loss weights: {foul_weights.tolist()}")
+    print(f"  Cached-train severity loss weights: {sev_weights.tolist()}")
+
+    # Model
     print("\nBuilding classifiers...")
     classifiers = XVARSClassifiers(input_dim=1024, hidden_dim=512)
     classifiers = classifiers.to(DEVICE)
-    total_params = sum(p.numel() for p in classifiers.parameters()
-                       if p.requires_grad)
-    print(f"Trainable parameters: {total_params:,}")
+    total_params = sum(
+        p.numel() for p in classifiers.parameters() if p.requires_grad
+    )
+    print(f"  Trainable parameters: {total_params:,}")
 
-    # Loss and optimizer
-    # Compute class weights from training data 
-    from collections import Counter
-    import numpy as np
+    # Loss: Focal Loss for imbalanced data
+    # No class weights needed — Focal Loss handles imbalance automatically
+    # Focal loss alone does not rebalance classes. Alpha explicitly gives the
+    # rare labels equal total weight in the loss.
+    foul_criterion = FocalLoss(gamma=2.0, alpha=foul_weights)
+    sev_criterion  = FocalLoss(gamma=2.0, alpha=sev_weights)
 
-    # Count foul labels in training set
-    foul_counts = Counter(s["foul_label"] for s in train_samples)
-    total = sum(foul_counts.values())
+    # Optimizer + Scheduler
+    optimizer = torch.optim.AdamW(
+        classifiers.parameters(),
+        lr=LR,
+        weight_decay=1e-4   # L2 regularization — helps generalization
+    )
 
-    # Weight = total / (num_classes * count)
-    # Minority class gets higher weight
-    num_classes = 2
-    foul_weights = torch.tensor([
-        total / (num_classes * foul_counts.get(i, 1))
-        for i in range(num_classes)
-    ], dtype=torch.float32).to(DEVICE)
-
-    # Same for severity
-    sev_counts = Counter(s["sev_label"] for s in train_samples)
-    num_sev_classes = 4
-    sev_weights = torch.tensor([
-        total / (num_sev_classes * sev_counts.get(i, 1))
-        for i in range(num_sev_classes)
-    ], dtype=torch.float32).to(DEVICE)
-
-    print(f"Foul class weights: {foul_weights.tolist()}")
-    print(f"Sev  class weights: {sev_weights.tolist()}")
-
-    # Weighted loss — minority class penalized more when wrong
-    foul_criterion = nn.CrossEntropyLoss(weight=foul_weights)
-    sev_criterion  = nn.CrossEntropyLoss(weight=sev_weights)
-
-    # Lower learning rate with scheduler
-    optimizer = torch.optim.Adam(classifiers.parameters(), lr=3e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=NUM_EPOCHS, eta_min=1e-5
+    # Warmup for first 5 epochs then cosine decay
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=LR,
+        steps_per_epoch=len(train_loader),
+        epochs=NUM_EPOCHS,
+        pct_start=0.1,      # 10% warmup
+        anneal_strategy='cos'
     )
 
     # Training loop
-    print("\nStarting fast training...")
-    print("=" * 55)
+    print("\nStarting training...")
+    print("=" * 60)
 
     history       = []
+    best_foul_balanced_acc = float("-inf")
     best_foul_acc = 0.0
+    best_sev_acc  = 0.0
+    no_improve    = 0
+    patience      = 15   # stop if no improvement for 15 epochs
 
     for epoch in range(1, NUM_EPOCHS + 1):
         print(f"\nEpoch {epoch}/{NUM_EPOCHS}")
 
         train_loss, train_foul, train_sev = train_one_epoch(
             classifiers, train_loader, optimizer,
-            foul_criterion, sev_criterion, DEVICE, epoch
+            foul_criterion, sev_criterion, scheduler, DEVICE, epoch
         )
 
-        val_loss, val_foul, val_sev = evaluate(
+        val_metrics = evaluate(
             classifiers, valid_loader,
             foul_criterion, sev_criterion, DEVICE, "valid"
         )
-        scheduler.step()
-        current_lr = scheduler.get_last_lr()[0]
-        print(f"  LR: {current_lr:.6f}")
+        val_loss = val_metrics["loss"]
+        val_foul = val_metrics["foul_acc"]
+        val_sev = val_metrics["sev_acc"]
+        val_foul_balanced = val_metrics["foul_balanced_acc"]
 
-        print(f"  Train — loss: {train_loss:.3f} | "
+        current_lr = optimizer.param_groups[0]['lr']
+
+        print(f"  Train — loss: {train_loss:.4f} | "
               f"foul: {train_foul:.1f}% | sev: {train_sev:.1f}%")
-        print(f"  Valid — loss: {val_loss:.3f}   | "
+        print(f"  Valid — loss: {val_loss:.4f}   | "
               f"foul: {val_foul:.1f}%   | sev: {val_sev:.1f}%")
+        print(f"  LR: {current_lr:.6f}")
+        print(f"  Foul balanced: {val_foul_balanced:.1f}% | "
+              f"recall [No foul, Foul]: {val_metrics['foul_recall']} | "
+              f"predictions: {val_metrics['foul_predictions']}")
 
         history.append({
             "epoch"          : epoch,
@@ -267,29 +369,49 @@ if __name__ == "__main__":
             "train_sev_acc"  : train_sev,
             "val_loss"       : val_loss,
             "val_foul_acc"   : val_foul,
+            "val_foul_balanced_acc": val_foul_balanced,
+            "val_foul_recall": val_metrics["foul_recall"],
             "val_sev_acc"    : val_sev,
+            "lr"             : current_lr,
         })
 
-        # Save best
-        if val_foul > best_foul_acc:
+        # Raw accuracy rewards the all-majority-class baseline. Select and
+        # early-stop using mean per-class foul recall instead.
+        improved = False
+        if val_foul_balanced > best_foul_balanced_acc:
+            best_foul_balanced_acc = val_foul_balanced
             best_foul_acc = val_foul
+            best_sev_acc  = val_sev
             os.makedirs(f"{SAVE_DIR}/best", exist_ok=True)
             torch.save({
                 "epoch"       : epoch,
                 "model_state" : classifiers.state_dict(),
                 "optim_state" : optimizer.state_dict(),
                 "val_foul_acc": val_foul,
+                "val_foul_balanced_acc": val_foul_balanced,
                 "val_sev_acc" : val_sev,
             }, f"{SAVE_DIR}/best/checkpoint_epoch_{epoch}.pt")
-            print(f"  New best foul accuracy: {best_foul_acc:.1f}%")
+            print(f"  ✓ New best — foul: {best_foul_acc:.1f}% | "
+                  f"sev: {best_sev_acc:.1f}%")
+            improved = True
+            no_improve = 0
+            print(f"  Selection metric — balanced foul: "
+                  f"{best_foul_balanced_acc:.1f}%")
 
-        # Save every 5 epochs
-        if epoch % 5 == 0:
+        if not improved:
+            no_improve += 1
+            if no_improve >= patience:
+                print(f"\n  Early stopping — no improvement for {patience} epochs")
+                break
+
+        # Checkpoint every 10 epochs
+        if epoch % 10 == 0:
             torch.save({
                 "epoch"       : epoch,
                 "model_state" : classifiers.state_dict(),
                 "optim_state" : optimizer.state_dict(),
                 "val_foul_acc": val_foul,
+                "val_foul_balanced_acc": val_foul_balanced,
                 "val_sev_acc" : val_sev,
             }, f"{SAVE_DIR}/checkpoint_epoch_{epoch}.pt")
 
@@ -297,7 +419,11 @@ if __name__ == "__main__":
     with open(f"{LOG_DIR}/training_history_fast.json", "w") as f:
         json.dump(history, f, indent=2)
 
-    print("\n" + "=" * 55)
+    print("\n" + "=" * 60)
     print("TRAINING COMPLETE")
-    print(f"Best validation foul accuracy: {best_foul_acc:.1f}%")
-    print("=" * 55)
+    print(f"Best validation balanced foul accuracy: "
+          f"{best_foul_balanced_acc:.1f}%")
+    print(f"Best validation foul accuracy : {best_foul_acc:.1f}%")
+    print(f"Best validation sev  accuracy : {best_sev_acc:.1f}%")
+    print(f"Checkpoint saved to           : {SAVE_DIR}/best/")
+    print("=" * 60)

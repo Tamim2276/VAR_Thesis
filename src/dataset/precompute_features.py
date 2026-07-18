@@ -6,13 +6,15 @@ from tqdm import tqdm
 from PIL import Image
 
 sys.path.append('.')
-from src.models.clip_extractor import load_clip_model
+from src.models.clip_extractor import get_patch_tokens, load_clip_model
 
 
 def precompute_clip_features(
     frames_root="data/frames",
     save_root="data/features",
-    device="xpu"
+    device="xpu",
+    finetuned_weights_path="models/clip_finetuned.pt",
+    overwrite=False,
 ):
     """
     Run every clip through CLIP once and save the CLS token.
@@ -23,6 +25,17 @@ def precompute_clip_features(
 
     print("Loading CLIP...")
     model, preprocess = load_clip_model()
+
+    if finetuned_weights_path and os.path.exists(finetuned_weights_path):
+        checkpoint = torch.load(
+            finetuned_weights_path, map_location="cpu", weights_only=True
+        )
+        state_dict = checkpoint.get("clip_model_state", checkpoint)
+        model.load_state_dict(state_dict)
+        overwrite = True
+        print(f"Loaded fine-tuned CLIP weights: {finetuned_weights_path}")
+        print("Existing feature files will be regenerated.")
+
     model = model.to(device)
     model.eval()
     print(f"CLIP loaded on {device}")
@@ -63,8 +76,8 @@ def precompute_clip_features(
                 save_name = clip_file.replace(".npy", ".pt")
                 save_path = os.path.join(save_dir, save_name)
 
-                # Skip if already computed
-                if os.path.exists(save_path):
+                # Recompute cached features when a fine-tuned encoder is used.
+                if os.path.exists(save_path) and not overwrite:
                     total_skipped += 1
                     continue
 
@@ -82,29 +95,11 @@ def precompute_clip_features(
 
                     batch = torch.stack(frame_tensors).to(device)  # (16, 3, 224, 224)
 
-                    # Run through CLIP — extract CLS tokens
+                    # Run through CLIP  extract CLS tokens
                     with torch.no_grad():
-                        visual = model.visual.to(device)
-
-                        x = visual.conv1(batch)
-                        x = x.reshape(x.shape[0], x.shape[1], -1)
-                        x = x.permute(0, 2, 1)
-
-                        cls = visual.class_embedding.unsqueeze(0).unsqueeze(0)
-                        cls = cls.expand(T, -1, -1)
-                        x = torch.cat([cls, x], dim=1)
-                        x = x + visual.positional_embedding.unsqueeze(0)
-
-                        if hasattr(visual, 'patch_dropout'):
-                            x = visual.patch_dropout(x)
-                        x = visual.ln_pre(x)
-
-                        x = x.permute(1, 0, 2)
-                        x = visual.transformer(x)
-                        x = x.permute(1, 0, 2)
-                        x = visual.ln_post(x)
-
-                    cls_tokens = x[:, 0, :]  # (16, 1024)
+                        # Keep the same unprojected CLS token used during
+                        # fine-tuning and by the downstream classifier heads.
+                        cls_tokens = get_patch_tokens(model, batch)[:, 0, :]
 
                     # Save to CPU before writing to disk
                     torch.save(
@@ -130,7 +125,7 @@ def precompute_clip_features(
             for action in os.listdir(sample_dir):
                 for f in os.listdir(os.path.join(sample_dir, action)):
                     sample = os.path.join(sample_dir, action, f)
-                    data = torch.load(sample)
+                    data = torch.load(sample, map_location="cpu", weights_only=True)
                     print(f"  File    : {sample}")
                     print(f"  CLS shape: {data['cls'].shape}")
                     size_kb = os.path.getsize(sample) / 1024

@@ -3,6 +3,9 @@ import numpy as np
 import open_clip
 from PIL import Image
 
+CLIP_MODEL_NAME = "ViT-L-14-quickgelu"
+CLIP_PRETRAINED_TAG = "openai"
+
 
 def load_clip_model():
     """
@@ -10,11 +13,16 @@ def load_clip_model():
     Called once at the start of your pipeline.
     """
     model, _, preprocess = open_clip.create_model_and_transforms(
-        'ViT-L-14',
-        pretrained='openai'
+        CLIP_MODEL_NAME,
+        pretrained=CLIP_PRETRAINED_TAG,
     )
     model.eval()  # evaluation mode — disables dropout
     return model, preprocess
+
+
+def get_visual_token_dim(model):
+    """Return the width of the unprojected CLS and patch tokens."""
+    return model.visual.class_embedding.shape[-1]
 
 
 def extract_spatial_tokens(model, preprocess, frames_numpy):
@@ -128,6 +136,12 @@ def get_patch_tokens(model, image_tensor):
 
     # Layer norm before transformer
     x = visual.ln_pre(x)
+
+    # open_clip 3.x transformers are batch-first (B, tokens, width). Passing
+    # sequence-first tokens to these models makes the CLS token ignore image
+    # patches and yields identical features for different frames.
+    if getattr(visual.transformer, "batch_first", False):
+        return visual.ln_post(visual.transformer(x))
 
     # Transformer expects sequence first
     # (1, 257, 1024) → (257, 1, 1024)

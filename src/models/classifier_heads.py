@@ -22,11 +22,9 @@ class FoulClassifier(nn.Module):
         # New deeper with batch norm
         self.classifier = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
             nn.Dropout(p=0.3),
             nn.Linear(hidden_dim, 256),
-            nn.BatchNorm1d(256),
             nn.ReLU(),
             nn.Dropout(p=0.2),
             nn.Linear(256, num_classes)
@@ -62,11 +60,9 @@ class SeverityClassifier(nn.Module):
         # New deeper with batch norm
         self.classifier = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
             nn.Dropout(p=0.3),
             nn.Linear(hidden_dim, 256),
-            nn.BatchNorm1d(256),
             nn.ReLU(),
             nn.Dropout(p=0.2),
             nn.Linear(256, num_classes)
@@ -164,13 +160,13 @@ if __name__ == "__main__":
     foul_pred, sev_pred = classifiers.predict(video_vector)
 
     foul_labels = ["No foul", "Foul"]
-    sev_labels = ["No card", "No card", "Yellow card", "Red card"]
+    sev_labels = [
+        "No offence",
+        "Offence - No card",
+        "Offence - Yellow card",
+        "Offence - Red card",
+    ]
 
     print(f"  Foul prediction    : {foul_labels[foul_pred.item()]}")
     print(f"  Severity prediction: {sev_labels[sev_pred.item()]}")
     print()
-    print("Note: predictions are random right now because")
-    print("the classifiers are not trained yet.")
-    print("They will make correct predictions after training.")
-
-    print("\nAll shapes correct — classifier heads ready!")
