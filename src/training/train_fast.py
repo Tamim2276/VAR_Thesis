@@ -4,7 +4,7 @@ import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 from collections import Counter
 
@@ -13,7 +13,7 @@ from src.models.classifier_heads import XVARSClassifiers
 from src.dataset.annotation_loader import load_annotations, get_split_samples
 
 
-# ── Focal Loss ──────────────────────────────────────────────────────────────
+# Focal Loss
 class FocalLoss(nn.Module):
     """
     Focal Loss for imbalanced classification.
@@ -235,6 +235,34 @@ def print_class_distribution(train_samples):
         print(f"    {sev_names[k]:12s}: {v:5d}  ({v/total*100:.1f}%)")
 
 
+def make_balanced_sampler(dataset):
+    """
+    Creates a WeightedRandomSampler that oversamples the minority class.
+    
+    Without this: each batch is ~86% foul, ~14% no-foul (matches dataset ratio)
+    With this:    each batch is ~50% foul, ~50% no-foul (balanced)
+    
+    The model is FORCED to see equal numbers of both classes,
+    so it can't take the shortcut of always predicting "foul".
+    """
+    foul_labels = [item["foul_label"] for item in dataset.items]
+    counts = Counter(foul_labels)
+    
+    # Weight for each sample = 1 / (number of samples in its class)
+    # This makes the total weight of each class equal
+    class_weights = {cls: 1.0 / count for cls, count in counts.items()}
+    sample_weights = [class_weights[label] for label in foul_labels]
+    
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(dataset),  # sample same number as dataset size
+        replacement=True           # must be True for oversampling minority
+    )
+    
+    print(f"  Balanced sampler: class weights = {class_weights}")
+    return sampler
+
+
 # Main
 if __name__ == "__main__":
 
@@ -242,10 +270,11 @@ if __name__ == "__main__":
     FEATURES_ROOT = "data/features"
     BATCH_SIZE    = 64
     NUM_EPOCHS    = 50
-    LR            = 1e-4
+    LR            = 5e-5        # lowered from 1e-4 for more stable training
     DEVICE        = "xpu"
     SAVE_DIR      = "models"
     LOG_DIR       = "logs"
+    FOCAL_GAMMA   = 3.0         # increased from 2.0 — more aggressive on easy examples
 
 
     os.makedirs(SAVE_DIR, exist_ok=True)
@@ -270,9 +299,13 @@ if __name__ == "__main__":
     valid_dataset = FeatureDataset(valid_samples, FEATURES_ROOT)
     print(f"  Train: {len(train_dataset)} | Valid: {len(valid_dataset)}")
 
+    # Balanced sampler — forces 50/50 foul/no-foul in each batch
+    train_sampler = make_balanced_sampler(train_dataset)
+
+    # Note: when using a sampler, shuffle must be False
     train_loader = DataLoader(
         train_dataset, batch_size=BATCH_SIZE,
-        shuffle=True, num_workers=0
+        sampler=train_sampler, num_workers=0
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=BATCH_SIZE,
@@ -299,21 +332,18 @@ if __name__ == "__main__":
     )
     print(f"  Trainable parameters: {total_params:,}")
 
-    # Loss: Focal Loss for imbalanced data
-    # No class weights needed — Focal Loss handles imbalance automatically
-    # Focal loss alone does not rebalance classes. Alpha explicitly gives the
-    # rare labels equal total weight in the loss.
-    foul_criterion = FocalLoss(gamma=2.0, alpha=foul_weights)
-    sev_criterion  = FocalLoss(gamma=2.0, alpha=sev_weights)
+    # Loss: Focal Loss with higher gamma for more aggressive downweighting
+    foul_criterion = FocalLoss(gamma=FOCAL_GAMMA, alpha=foul_weights)
+    sev_criterion  = FocalLoss(gamma=FOCAL_GAMMA, alpha=sev_weights)
 
-    # Optimizer + Scheduler
+    # Optimizer with stronger weight decay for regularization
     optimizer = torch.optim.AdamW(
         classifiers.parameters(),
         lr=LR,
-        weight_decay=1e-4   # L2 regularization — helps generalization
+        weight_decay=5e-3   # increased from 1e-4 — fights overfitting
     )
 
-    # Warmup for first 5 epochs then cosine decay
+    # Warmup for first 10% then cosine decay
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=LR,
@@ -324,7 +354,9 @@ if __name__ == "__main__":
     )
 
     # Training loop
-    print("\nStarting training...")
+    print(f"\nStarting training...")
+    print(f"  LR: {LR} | Weight decay: 5e-3 | Focal gamma: {FOCAL_GAMMA}")
+    print(f"  Balanced sampling: ON")
     print("=" * 60)
 
     history       = []
