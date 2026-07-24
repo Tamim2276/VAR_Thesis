@@ -333,7 +333,8 @@ if __name__ == "__main__":
     print(f"  Trainable parameters: {total_params:,}")
 
     # Loss: Focal Loss with higher gamma for more aggressive downweighting
-    foul_criterion = FocalLoss(gamma=FOCAL_GAMMA, alpha=foul_weights)
+    # We remove alpha from foul_criterion because the Balanced Sampler already ensures 50/50 batches!
+    foul_criterion = FocalLoss(gamma=FOCAL_GAMMA, alpha=None)
     sev_criterion  = FocalLoss(gamma=FOCAL_GAMMA, alpha=sev_weights)
 
     # Optimizer with stronger weight decay for regularization

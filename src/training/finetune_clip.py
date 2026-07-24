@@ -16,7 +16,7 @@ from src.dataset.annotation_loader import load_annotations, get_split_samples
 class FoulVideoDataset(Dataset):
     """Loads raw frames for CLIP fine-tuning.
     
-    Uses single center frame per clip for speed.
+    Uses 4 key frames spread across the clip for better temporal context.
     CLIP just needs to learn football-relevant features —
     the downstream classifier heads (train_fast.py) will
     train on all 16 frames' features.
@@ -31,11 +31,22 @@ class FoulVideoDataset(Dataset):
 
     def __getitem__(self, idx):
         s = self.samples[idx]
-        frames = np.load(s["clip_path"])  # (16, 224, 224, 3)
+        frames = np.load(s["clip_path"])  # Usually (16, 224, 224, 3)
 
-        # Use single center frame — captures the peak foul moment
-        center = frames[8]
-        tensor = self.preprocess(Image.fromarray(center))  # (3, 224, 224)
+        # 4 key frames spread across the clip
+        T = frames.shape[0]
+        key_indices = [
+            int(T * 0.25),   # before contact
+            int(T * 0.50),   # contact moment
+            int(T * 0.75),   # after contact
+            int(T * 0.90),   # end of clip
+        ]
+        tensors = []
+        for fi in key_indices:
+            t = self.preprocess(Image.fromarray(frames[fi]))
+            tensors.append(t)
+
+        tensor = torch.stack(tensors)  # (4, 3, 224, 224)
 
         foul_label = torch.tensor(s["foul_label"], dtype=torch.long)
         sev_label  = torch.tensor(s["sev_label"],  dtype=torch.long)
@@ -57,9 +68,9 @@ if __name__ == "__main__":
     DEVICE      = "xpu"
     BATCH_SIZE = 4           # Tiny physical batch to fit in 12GB VRAM
     ACCUMULATION_STEPS = 8   # 4 * 8 = 32 effective batch size
-    NUM_EPOCHS  = 10         # more epochs needed with lower learning rates
+    NUM_EPOCHS  = 15         # more epochs needed with lower learning rates
     SAVE_PATH   = "models/clip_finetuned.pt"
-    BACKBONE_LR = 1e-6       # very conservative — prevent gradient explosion
+    BACKBONE_LR = 5e-6       # very conservative — prevent gradient explosion
     HEAD_LR     = 3e-4       # lowered from 1e-3 to prevent NaN
 
     if DEVICE == "xpu" and not torch.xpu.is_available():
@@ -180,7 +191,10 @@ if __name__ == "__main__":
             autocast_dtype  = torch.bfloat16 if DEVICE == "xpu" else torch.float32
 
             with torch.autocast(device_type=autocast_device, dtype=autocast_dtype):
-                features = get_patch_tokens(clip_model, imgs)[:, 0, :]
+                B, N, C, H, W = imgs.shape
+                imgs_flat  = imgs.view(B * N, C, H, W)
+                feats_flat = get_patch_tokens(clip_model, imgs_flat)[:, 0, :]
+                features   = feats_flat.view(B, N, -1).mean(dim=1)
                 features = features.float()
 
                 foul_logits = foul_head(features)
@@ -253,8 +267,12 @@ if __name__ == "__main__":
                 autocast_dtype  = torch.bfloat16 if DEVICE == "xpu" else torch.float32
 
                 with torch.autocast(device_type=autocast_device, dtype=autocast_dtype):
-                    features = get_patch_tokens(clip_model, imgs)[:, 0, :]
+                    B, N, C, H, W = imgs.shape
+                    imgs_flat  = imgs.view(B * N, C, H, W)
+                    feats_flat = get_patch_tokens(clip_model, imgs_flat)[:, 0, :]
+                    features   = feats_flat.view(B, N, -1).mean(dim=1)
                     features = features.float()
+
                     foul_logits = foul_head(features)
                     sev_logits  = sev_head(features)
 
