@@ -1,0 +1,100 @@
+import torch
+import torch.nn as nn
+from transformers import AutoModelForCausalLM, AutoConfig
+
+class RefereeVLM(nn.Module):
+    def __init__(self, visual_dim=1152, llm_name="microsoft/Phi-3-mini-4k-instruct"):
+        super().__init__()
+        print(f"Loading LLM: {llm_name}...")
+        
+        # Load the LLM in bfloat16 to save memory
+        self.llm = AutoModelForCausalLM.from_pretrained(
+            llm_name,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            device_map="auto" # Automatically uses GPU if available
+        )
+        
+        # Freeze the LLM entirely
+        for param in self.llm.parameters():
+            param.requires_grad = False
+            
+        # Get LLM hidden size (Phi-3-mini is 3072)
+        self.llm_hidden_size = self.llm.config.hidden_size
+        
+        print(f"Building Projection Layer ({visual_dim} -> {self.llm_hidden_size})")
+        # Trainable projection layer
+        self.projection = nn.Sequential(
+            nn.Linear(visual_dim, self.llm_hidden_size),
+            nn.GELU(),
+            nn.Linear(self.llm_hidden_size, self.llm_hidden_size)
+        ).to(torch.bfloat16) # Match LLM dtype
+        
+    def forward(self, visual_features, input_ids, attention_mask=None, labels=None):
+        """
+        visual_features: (Batch, 16, 1152)
+        input_ids: (Batch, SeqLen)
+        attention_mask: (Batch, SeqLen)
+        labels: (Batch, SeqLen)
+        """
+        # Ensure visual features match projection layer dtype
+        visual_features = visual_features.to(self.projection[0].weight.dtype)
+        
+        # 1. Project visual features to LLM embedding space -> (Batch, 16, 3072)
+        visual_embeds = self.projection(visual_features)
+        
+        # 2. Get text embeddings from the frozen LLM -> (Batch, SeqLen, 3072)
+        text_embeds = self.llm.get_input_embeddings()(input_ids)
+        
+        # 3. Concatenate visual embeddings BEFORE text embeddings
+        # Shape: (Batch, 16 + SeqLen, 3072)
+        combined_embeds = torch.cat([visual_embeds, text_embeds], dim=1)
+        
+        # Combine attention masks
+        if attention_mask is not None:
+            batch_size = attention_mask.size(0)
+            visual_mask = torch.ones((batch_size, 16), dtype=attention_mask.dtype, device=attention_mask.device)
+            combined_mask = torch.cat([visual_mask, attention_mask], dim=1)
+        else:
+            combined_mask = None
+            
+        if labels is not None:
+            # Prepend -100 to labels for the 16 visual tokens so loss isn't computed on them
+            batch_size = labels.size(0)
+            visual_labels = torch.full((batch_size, 16), -100, dtype=labels.dtype, device=labels.device)
+            combined_labels = torch.cat([visual_labels, labels], dim=1)
+            
+            # 4. Forward pass through LLM
+            outputs = self.llm(inputs_embeds=combined_embeds, attention_mask=combined_mask, labels=combined_labels)
+            return outputs
+        else:
+            # Inference mode
+            outputs = self.llm(inputs_embeds=combined_embeds, attention_mask=combined_mask)
+            return outputs
+            
+    def generate(self, visual_features, input_ids, attention_mask=None, max_new_tokens=50, tokenizer=None):
+        """
+        Helper for generation during evaluation.
+        Note: inputs_embeds is supported by Phi-3, but generate with inputs_embeds requires 
+        passing the embeds directly.
+        """
+        visual_features = visual_features.to(self.projection[0].weight.dtype)
+        visual_embeds = self.projection(visual_features)
+        text_embeds = self.llm.get_input_embeddings()(input_ids)
+        combined_embeds = torch.cat([visual_embeds, text_embeds], dim=1)
+        
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+        batch_size = attention_mask.size(0)
+        visual_mask = torch.ones((batch_size, 16), dtype=attention_mask.dtype, device=attention_mask.device)
+        combined_mask = torch.cat([visual_mask, attention_mask], dim=1)
+        
+        outputs = self.llm.generate(
+            inputs_embeds=combined_embeds,
+            attention_mask=combined_mask,
+            max_new_tokens=max_new_tokens,
+            pad_token_id=tokenizer.pad_token_id if tokenizer else self.llm.config.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id if tokenizer else self.llm.config.eos_token_id,
+            do_sample=False # greedy for factual extraction
+        )
+        return outputs

@@ -1,3 +1,29 @@
 data/
 venv/
-models/
+BestModels/
+# Data and Environments
+data/
+venv/
+
+# Model Checkpoints and Weights
+BestModels/
+/models/
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Large Archives
+*.zip
+*.tar.gz
+kaggle_upload.zip
+
+# Outputs and Logs
+outputs/
+logs/
+plots/
+
+# Python Caches
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
