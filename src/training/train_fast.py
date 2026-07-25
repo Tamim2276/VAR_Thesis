@@ -325,7 +325,7 @@ if __name__ == "__main__":
 
     # Model
     print("\nBuilding classifiers...")
-    classifiers = XVARSClassifiers(input_dim=1024, hidden_dim=512)
+    classifiers = XVARSClassifiers(input_dim=1152, hidden_dim=512)
     classifiers = classifiers.to(DEVICE)
     total_params = sum(
         p.numel() for p in classifiers.parameters() if p.requires_grad

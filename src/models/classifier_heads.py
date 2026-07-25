@@ -10,7 +10,7 @@ class FoulClassifier(nn.Module):
     Output: (batch_size, 2)    — scores for [No foul, Foul]
     """
 
-    def __init__(self, input_dim=1024, hidden_dim=512, num_classes=2):
+    def __init__(self, input_dim=1152, hidden_dim=512, num_classes=2):
         """
         Args:
             input_dim  : size of CLIP's output vector (1024 for ViT-L/14)
@@ -48,7 +48,7 @@ class SeverityClassifier(nn.Module):
     Output: (batch_size, 4)    — scores for each severity level
     """
 
-    def __init__(self, input_dim=1024, hidden_dim=512, num_classes=4):
+    def __init__(self, input_dim=1152, hidden_dim=512, num_classes=4):
         """
         Args:
             input_dim  : size of CLIP's output vector (1024 for ViT-L/14)
@@ -83,7 +83,7 @@ class XVARSClassifiers(nn.Module):
         sev_logits : (batch_size, 4) — severity level
     """
 
-    def __init__(self, input_dim=1024, hidden_dim=512):
+    def __init__(self, input_dim=1152, hidden_dim=512):
         super(XVARSClassifiers, self).__init__()
 
         self.foul_head = FoulClassifier(
@@ -127,27 +127,27 @@ if __name__ == "__main__":
     import numpy as np
     sys.path.append('.')
 
-    from src.models.clip_extractor import load_clip_model, extract_spatial_tokens
+    from src.models.siglip_extractor import load_siglip_model, extract_spatial_tokens
 
-    print("Step 1 — Load CLIP...")
-    model, preprocess = load_clip_model()
+    print("Step 1 — Load SigLIP...")
+    model, preprocess = load_siglip_model()
 
     print("Step 2 — Load one real clip...")
     frames = np.load("data/frames/test/action_0/clip_0.npy")
     print(f"  Frames shape: {frames.shape}")
 
-    print("Step 3 — Extract CLS tokens from CLIP...")
-    cls_tokens, spatial_tokens = extract_spatial_tokens(model, preprocess, frames)
+    print("Step 3 — Extract features from SigLIP...")
+    cls_tokens, spatial_tokens = extract_spatial_tokens(model, preprocess, frames, batch_size=8)
     print(f"  CLS tokens shape: {cls_tokens.shape}")
 
-    # Average CLS tokens across all 16 frames
+    # Average pooler tokens across all 16 frames
     # to get one single video-level representation
-    # (16, 1024) → (1024,) → (1, 1024) for batch dimension
+    # (16, 1152) → (1152,) → (1, 1152) for batch dimension
     video_vector = cls_tokens.mean(dim=0).unsqueeze(0)
     print(f"  Video vector shape: {video_vector.shape}")
 
     print("\nStep 4 — Build classifiers...")
-    classifiers = XVARSClassifiers(input_dim=1024, hidden_dim=512)
+    classifiers = XVARSClassifiers(input_dim=1152, hidden_dim=512)
     print(f"  Foul head params    : {sum(p.numel() for p in classifiers.foul_head.parameters()):,}")
     print(f"  Severity head params: {sum(p.numel() for p in classifiers.severity_head.parameters()):,}")
 
