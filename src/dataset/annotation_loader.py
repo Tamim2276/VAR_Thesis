@@ -10,11 +10,11 @@ FOUL_LABELS = {
 }
 
 SEVERITY_LABELS = {
-    1.0 : 0,  # No card
-    2.0 : 1,  # No card borderline
-    3.0 : 2,  # Yellow card
-    4.0 : 3,  # Red card
-    5.0 : 3,  # treat as Red card (most severe)
+    1.0 : 0,  # No card          → class 0 (No Card)
+    2.0 : 0,  # No card borderline → class 0 (No Card) — merged!
+    3.0 : 1,  # Yellow card       → class 1 (Yellow)
+    4.0 : 2,  # Red card          → class 2 (Red)
+    5.0 : 2,  # treat as Red card → class 2 (Red)
 }
 
 ACTION_CLASS_LABELS = {
