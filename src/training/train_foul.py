@@ -31,6 +31,13 @@ class FeatureDataset(Dataset):
                     "feat_path" : feat_path,
                     "foul_label": s["foul_label"],
                 })
+                # Check for flipped version (data augmentation)
+                flip_path = feat_path.replace(".pt", "_flip.pt")
+                if s["split"] == "train" and os.path.exists(flip_path):
+                    self.items.append({
+                        "feat_path" : flip_path,
+                        "foul_label": s["foul_label"],
+                    })
             else:
                 skipped += 1
         if skipped > 0:
